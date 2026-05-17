@@ -1,0 +1,202 @@
+% Phase 1 draft — Foundation & Analysis
+% Compile: pdflatex phase1.tex (run twice for references if you add \cite{})
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{graphicx}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue,
+}
+
+\title{Phase~1 Draft: Text-to-Video Diffusion with a Lightweight 3D U-Net\\
+\large Foundation \& Analysis}
+\author{Your Name \\ Course / Institution}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study denoising diffusion probabilistic models (DDPMs) for short text-conditioned video clips.
+This phase~1 draft is written to support the foundation review: a concrete creative theme, an explicit statement of which components are \emph{architecturally} inherited from modern diffusion systems versus which weights are pretrained, a concise DDPM treatment (forward process, simplified loss, CFG, schedules, prediction targets), a implementation-grounded 3D U-Net description, and two weakness studies with planned metrics (temporal flicker; text--video alignment).
+\end{abstract}
+
+% ---------------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+
+\subsection{Selected theme and motivation}
+Our creative theme is \textbf{Dreamlike Cities of the Future}: short cinematic clips in futuristic-urban settings, emphasizing coherent motion, lighting, and semantic alignment to the prompt (see \texttt{src/data/prompts.py} in the codebase).
+Example prompts include neon street scenes, aerial traffic above skyscrapers, and cyberpunk markets---chosen so that \emph{temporal structure} (camera motion, drifting fog, traffic flow) is part of the intended content, which stress-tests temporal modeling.
+
+More broadly, we study \emph{text-to-video} generation: given a natural-language prompt, the system should produce a short clip that matches the semantics of the text while avoiding distracting frame-to-frame inconsistencies (flicker, object ``jitter,'' sudden appearance changes).
+We are motivated by the gap between strong image diffusion models and video: independent frame synthesis often looks plausible per frame yet fails as \emph{motion} and \emph{continuity}.
+Diffusion offers a principled generative framework; extending it to spatiotemporal tensors raises efficiency, conditioning, and temporal-stability questions that we treat as first-class design constraints.
+
+\subsection{Scope of this phase~1 draft}
+This document satisfies the week~13 foundation checklist and matches the topics a TA typically probes in an early session: motivation (\S\ref{sec:intro}), what is meant by a ``pretrained model'' in our setup (\S\ref{sec:arch}), mathematical grounding (\S\ref{sec:math}), architecture details (\S\ref{sec:arch}), and weakness analysis with metrics (\S\ref{sec:weak}).
+
+% ---------------------------------------------------------------------------
+\section{Background and Mathematics}
+\label{sec:math}
+
+\subsection{Forward noising process (DDPM)}
+Let a clean video clip be a tensor $x_0 \in \mathbb{R}^{C \times T \times H \times W}$.
+DDPM defines a Markov forward process that gradually adds Gaussian noise over discrete steps $t = 1,\ldots,T$:
+\begin{equation}
+  q(x_t \mid x_{t-1}) = \mathcal{N}\bigl(x_t; \sqrt{1-\beta_t}\, x_{t-1},\, \beta_t I\bigr),
+\end{equation}
+with variance schedule $\{\beta_t\}$.
+Using the reparameterization trick, one may sample $x_t$ directly from $x_0$:
+\begin{equation}
+  q(x_t \mid x_0) = \mathcal{N}\bigl(x_t; \sqrt{\bar{\alpha}_t}\, x_0,\, (1-\bar{\alpha}_t) I\bigr),
+  \qquad
+  x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1-\bar{\alpha}_t}\,\epsilon,\ \epsilon \sim \mathcal{N}(0,I),
+\end{equation}
+where $\alpha_t = 1-\beta_t$ and $\bar{\alpha}_t = \prod_{s=1}^t \alpha_s$.
+As $t$ grows, $\bar{\alpha}_t \to 0$ and $x_t$ approaches pure noise.
+
+\subsection{Reverse denoising and score intuition}
+The generative model learns a reverse Markov chain $p_\theta(x_{t-1}\mid x_t, c)$ (with conditioning $c$, e.g.\ a text embedding) to denoise samples.
+In practice, $p_\theta$ is implemented by a neural network that predicts noise $\epsilon$, clean $x_0$, or a reparameterized target (see below).
+The \emph{score} $\nabla_x \log p(x)$ points toward higher-density regions under the data distribution; denoising networks are closely related to learning such scores, and predicting noise under Gaussian perturbations is a standard scalable parameterization.
+
+\subsection{Training objective (ELBO and simplified loss)}
+Maximizing a variational lower bound (ELBO) on $\log p(x_0\mid c)$ leads to a weighted sum of denoising terms.
+Following Ho et al.\ (DDPM), one uses a simplified objective: sample $t$, noise $\epsilon$, form $x_t$, and minimize expected $\ell_2$ error between the network prediction and a chosen target (e.g.\ $\epsilon$).
+We do not reproduce the full ELBO algebra here; the key idea is that a weighted denoising autoencoder loss approximates gradual removal of noise consistent with the forward process.
+
+\paragraph{Operational training step (what the code implements).}
+Each minibatch draws a clean clip $x_0$, samples a step $t$ and Gaussian noise $\epsilon$, constructs $x_t = \sqrt{\bar{\alpha}_t}x_0 + \sqrt{1-\bar{\alpha}_t}\epsilon$, runs the network to obtain a prediction of the chosen target (here $\epsilon$), and backpropagates MSE plus any auxiliary terms (e.g.\ temporal smoothness on the target).
+At sampling time, the network's noise estimate is inserted into the DDPM or DDIM update to step from $x_t$ toward $x_{t-1}$.
+
+\subsection{Prediction targets and loss functions}
+Let $f_\theta(x_t, t, c)$ be the network output. Common choices:
+\begin{itemize}
+  \item \textbf{Noise ($\epsilon$) prediction.} Target $\epsilon$. Loss: $\mathcal{L}_\epsilon = \mathbb{E}\bigl[\| f_\theta(x_t,t,c) - \epsilon \|_2^2\bigr]$.
+  \item \textbf{$x_0$ prediction.} Target $x_0$. Equivalent reparameterizations map $x_0$-prediction to an implied noise estimate.
+  \item \textbf{$v$-prediction.} Target $v = \sqrt{\bar{\alpha}_t}\,\epsilon - \sqrt{1-\bar{\alpha}_t}\, x_0$, which can stabilize training across noise levels.
+\end{itemize}
+Our default configuration uses \textbf{$\epsilon$-prediction} (\texttt{diffusion.prediction\_target: eps}).
+
+\subsection{Classifier-free guidance (CFG)}
+During training, conditioning is randomly dropped with probability $p_{\text{drop}}$ so the model also sees unconditional inputs.
+At sampling time, one forms conditional and unconditional predictions and extrapolates:
+\begin{equation}
+  \tilde{\epsilon} = \epsilon_{\text{unc}} + w\bigl(\epsilon_{\text{cond}} - \epsilon_{\text{unc}}\bigr),
+  \label{eq:cfg}
+\end{equation}
+with guidance scale $w \ge 1$.
+Larger $w$ typically improves text alignment but may reduce diversity and cause artifacts.
+
+\subsection{Noise schedules}
+We implement \textbf{linear} and \textbf{cosine} $\beta$-schedules (\texttt{diffusion.beta\_schedule}).
+Linear schedules are simple and common; cosine schedules slow the destruction of signal at early timesteps and often improve sample quality in image models.
+We default to \textbf{linear} in our base config but note cosine as an ablation axis for stability and fidelity.
+
+\subsection{Video-specific considerations}
+Naive \emph{frame-wise} diffusion ignores temporal coupling: each frame may be sharp yet jointly inconsistent.
+Our model processes $x \in \mathbb{R}^{C\times T\times H\times W}$ with \textbf{3D convolutions} and \textbf{temporal self-attention} so that denoising at step $t$ depends on neighboring frames.
+We operate in \textbf{pixel space} (no latent VAE) for transparency and implementation simplicity, at higher compute cost than latent video diffusion at equal resolution.
+
+% ---------------------------------------------------------------------------
+\section{Model Architecture}
+\label{sec:arch}
+
+\subsection{``Pretrained model'': architecture versus checkpoint}
+Course materials often ask for a \emph{selected pretrained model}; in our project we separate two notions:
+\begin{itemize}
+  \item \textbf{Selected architecture (diffusion denoiser).} We use a \textbf{3D U-Net} denoiser (\texttt{VideoUNet3D}), the same broad family as DDPM/Imagen-style image U-Nets extended to video tensors: residual blocks, downsampling/upsampling, skip connections, and attention for mixing information across positions.
+  The \textbf{denoiser weights are trained from scratch} on our dataset; we do not load a public text-to-video checkpoint.
+  \item \textbf{Optional pretrained module (text side).} When \texttt{model.text\_encoder} is set to \texttt{clip}, prompt conditioning uses a \textbf{pretrained CLIP text tower} (OpenCLIP weights) mapped into the U-Net via projection and addition to the timestep embedding.
+  The default \texttt{hash} encoder is \textbf{not} pretrained: it is a lightweight hash embedding for fast iteration, with weaker semantics (a deliberate baseline discussed in \S\ref{sec:weak}).
+\end{itemize}
+In a TA discussion, the honest one-liner is: \emph{pretrained CLIP text features are optional; the spatiotemporal denoiser follows standard diffusion U-Net design but is learned end-to-end in our setting.}
+
+\subsection{Choice of denoiser}
+We adopt the \texttt{VideoUNet3D} backbone described above: encoder--decoder structure with skip connections, \texttt{ResBlock3D} stages, a middle stack with temporal self-attention, and a convolutional output head returning a tensor shaped like the noisy video input.
+
+\subsection{Timestep and text conditioning}
+A sinusoidal embedding of the diffusion index $t$ is passed through an MLP to produce a timestep embedding.
+Text prompts are embedded with either a lightweight \textbf{hash bag-of-n-grams} encoder (default) or an optional \textbf{CLIP} text tower for stronger alignment.
+The text vector is projected and \textbf{added} to the timestep embedding (early fusion), then injected into each residual block via projection to channel space---rather than full cross-attention over spatial--temporal tokens.
+For classifier-free guidance, training randomly replaces the conditional embedding with an unconditional token with probability \texttt{train.cond\_drop\_prob} (e.g.\ $0.1$), so the same network learns both branches used in Eq.~\eqref{eq:cfg} at inference.
+
+\subsection{Backbone details (implementation mapping)}
+\begin{itemize}
+  \item \textbf{Residual blocks:} \texttt{ResBlock3D} uses GroupNorm, SiLU, $3\times3\times3$ convolutions, and timestep scale-shift.
+  \item \textbf{Pooling / expansion:} strided 3D convolution downsamples spatially; transposed convolution upsamples; skip connections concatenate encoder features.
+  \item \textbf{Attention:} \texttt{SelfAttention3D} applies multi-head attention \emph{over time} independently at each spatial location (memory-aware temporal attention).
+  \item \textbf{Output head:} a final convolution predicts the network target (e.g.\ noise) with the same shape as $x$.
+\end{itemize}
+
+\subsection{Sampling}
+Training uses the forward $q$-process; generation uses either \textbf{DDPM} stochastic sampling or \textbf{DDIM} fewer-step sampling.
+Our base configuration sets \texttt{sample.sampler: ddim} with \texttt{num\_steps: 50} and \texttt{guidance\_scale: 5.0}.
+
+% ---------------------------------------------------------------------------
+\section{Weakness Analysis}
+\label{sec:weak}
+
+We highlight two weaknesses that are concrete in text-to-video diffusion and measurable with standard metrics.
+For each, we state a hypothesis, a mitigation implemented in our repository, and how we quantify impact.
+\textbf{Replace placeholder values in Table~\ref{tab:weak} with results from your runs} (e.g.\ \texttt{python -m src.evaluate} on paired prediction/reference folders).
+
+\subsection{Weakness 1: Temporal flicker and weak temporal consistency}
+\paragraph{Observation.}
+Generated clips exhibit high-frequency temporal variation: textures and edges ``boil'' between frames even when the prompt is static.
+
+\paragraph{Hypothesis.}
+The plain $\epsilon$-objective does not explicitly penalize \emph{changes} in the predicted target across time, so the optimizer may settle on per-frame denoising solutions that are not temporally smooth.
+
+\paragraph{Mitigation.}
+We add an auxiliary \textbf{temporal smoothness} penalty on the training target: a weighted $\ell_2$ penalty on frame-to-frame differences of the prediction target (\texttt{train.temporal\_smooth\_weight}, default $0.02$).
+
+\paragraph{Metrics.}
+We report a \textbf{temporal LPIPS} (average LPIPS between adjacent predicted frames; lower is smoother) and a \textbf{FVD proxy} comparing feature statistics of predicted vs.\ reference frames (lower is better; note this is a proxy, not full I3D-FVD).
+
+\subsection{Weakness 2: Weak text--video semantic alignment}
+\paragraph{Observation.}
+The model ignores parts of the prompt or binds attributes incorrectly (wrong object/color/action), especially under the default hash text encoder.
+
+\paragraph{Hypothesis.}
+Hash embeddings provide limited semantic structure compared to contrastive language--image models; the conditioning signal is too weak for fine-grained alignment.
+
+\paragraph{Mitigation.}
+Swap \texttt{model.text\_encoder} to \textbf{CLIP} and set \texttt{text\_emb\_dim: 512}; keep CFG enabled. Optionally increase guidance within reasonable limits to trade diversity for alignment.
+
+\paragraph{Metrics.}
+We report \textbf{CLIP similarity} between the prompt and generated frames (higher is better, requires \texttt{open-clip-torch}) and optionally \textbf{SSIM / PSNR} against reference clips when available.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Example weakness study (fill with your experimental numbers). ``Baseline'' matches \texttt{configs/base.yaml} unless noted.}
+  \label{tab:weak}
+  \begin{tabular}{@{}lcccc@{}}
+    \toprule
+    Setting & Temp.\ LPIPS $\downarrow$ & FVD proxy $\downarrow$ & CLIP-SIM $\uparrow$ & Notes \\
+    \midrule
+    Baseline (hash, no smooth) & -- & -- & -- & \\
+    + temporal smooth & -- & -- & -- & weight $0.02$ \\
+    + CLIP text (smooth on/off) & -- & -- & -- & \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Brief discussion}
+The two weaknesses interact: stronger alignment (high CFG, CLIP) can sometimes exacerbate temporal artifacts if the denoiser struggles to reconcile text constraints with smooth dynamics; joint tuning of guidance, steps, and smoothness weight is expected.
+
+% ---------------------------------------------------------------------------
+\section*{Acknowledgments (optional)}
+Replace with collaborators, compute resources, or citations when you extend the draft.
+
+\end{document}

@@ -1,0 +1,52 @@
+project:
+  name: short_movie_clip_generation
+  seed: 42
+
+data:
+  dataset_root: data/videos
+  channels: 3
+  num_frames: 8
+  frame_size: 32
+  batch_size: 1
+
+model:
+  # CPU-friendly defaults; increase only after confirming memory headroom.
+  base_channels: 32
+  channel_mults: [1, 2, 4]
+  time_emb_dim: 128
+  # hash: lightweight prompt embedding; clip: stronger alignment (set text_emb_dim: 512, pip install open-clip-torch)
+  text_encoder: hash
+  text_emb_dim: 128
+
+diffusion:
+  timesteps: 1000
+  beta_schedule: linear # options: linear, cosine
+  prediction_target: eps # options: eps, x0, v
+
+train:
+  lr: 0.0001
+  epochs: 5
+  grad_clip: 1.0
+  cond_drop_prob: 0.1
+  # Penalize frame-to-frame jumps in the prediction target (temporal flicker mitigation).
+  temporal_smooth_weight: 0.02
+  save_every: 1
+  checkpoint_dir: checkpoints
+
+sample:
+  sampler: ddim # options: ddpm, ddim
+  num_steps: 50
+  guidance_scale: 5.0
+  output_dir: outputs/generated
+
+# Bonus: neural TTS (Microsoft Edge voices via edge-tts) + ffmpeg mux
+audio:
+  enable: false
+  narration_from_prompt: false # if true, use image prompt as narration when --narration is empty
+  voice: en-US-AriaNeural # try en-US-GuyNeural, en-GB-SoniaNeural — run: edge-tts --list-voices
+  emotion: neutral # happy | excited | sad | calm
+  chunk_chars: 320
+  # Optional overrides (Edge format): e.g. rate: "+8%", pitch: "+2Hz", volume: "+5%"
+  rate: null
+  pitch: null
+  volume: null

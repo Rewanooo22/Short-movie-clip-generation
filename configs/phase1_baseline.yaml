@@ -1,0 +1,48 @@
+# Phase-1 ablation: hash text, no temporal smooth (weakness baseline).
+project:
+  name: phase1_baseline
+  seed: 42
+
+data:
+  dataset_root: data/videos
+  channels: 3
+  num_frames: 8
+  frame_size: 32
+  batch_size: 1
+
+model:
+  base_channels: 32
+  channel_mults: [1, 2, 4]
+  time_emb_dim: 128
+  text_encoder: hash
+  text_emb_dim: 128
+
+diffusion:
+  timesteps: 1000
+  beta_schedule: linear
+  prediction_target: eps
+
+train:
+  lr: 0.0001
+  epochs: 2
+  grad_clip: 1.0
+  cond_drop_prob: 0.1
+  temporal_smooth_weight: 0.0
+  save_every: 1
+  checkpoint_dir: checkpoints/phase1_baseline
+
+sample:
+  sampler: ddim
+  num_steps: 50
+  guidance_scale: 5.0
+  output_dir: outputs/phase1/pred_baseline
+
+audio:
+  enable: false
+  narration_from_prompt: false
+  voice: en-US-AriaNeural
+  emotion: neutral
+  chunk_chars: 320
+  rate: null
+  pitch: null
+  volume: null
